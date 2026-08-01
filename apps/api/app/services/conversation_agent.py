@@ -358,6 +358,13 @@ def _merge_state(
 ) -> ConversationState:
     data = current.model_dump()
     for key, value in extracted.model_dump().items():
+        if key == "restrictions_confirmed" and value is None:
+            value = current.restrictions_confirmed
+        if key == "restrictions" and isinstance(value, dict):
+            value = value.get("restrictions", [])
+            if "restrictions_confirmed" in value:
+                value = value.get("restrictions_confirmed", False)
+        
         if value is None:
             continue
         if isinstance(value, list):
@@ -390,7 +397,7 @@ def _missing_fields(state: ConversationState) -> list[str]:
         missing.append("outing_type")
     if not state.music_preferences:
         missing.append("music_preferences")
-    if not state.restrictions:
+    if not state.restrictions_confirmed:
         missing.append("restrictions")
 
     if (
@@ -414,6 +421,8 @@ def _fallback_reply(
     if state.missing_fields:
         return _collection_question(state.missing_fields[0])
 
+    
+
     return (
         "Tengo la información base. El siguiente paso es calcular recomendaciones con el "
         "motor determinístico para cruzar presupuesto, zonas y preferencias del grupo."
@@ -422,6 +431,7 @@ def _fallback_reply(
 
 def _rule_extract(message: str) -> ExtractedConversationData:
     text = message.lower()
+    restrictions, restrictions_confirmed = _extract_restrictions(text)
     return ExtractedConversationData(
         budget_per_person=_extract_budget(text),
         event_date=_extract_date(text),
@@ -430,7 +440,8 @@ def _rule_extract(message: str) -> ExtractedConversationData:
         origin_zones=_extract_origins(message),
         outing_type=_extract_outing_type(text),
         people_count=_extract_people_count(text),
-        restrictions=_extract_restrictions(text),
+        restrictions=restrictions,
+        restrictions_confirmed=restrictions_confirmed,
     )
 
 
@@ -448,6 +459,25 @@ def _collection_question(field: str) -> str:
     }
     return questions[field]
 
+
+def extract_restrictions_confirmation(message: str) -> tuple[list[str] | None, bool | None]:
+    normalized = message.strip().lower()
+
+    no_restrictions_phrases = {
+        "no",
+        "ninguna",
+        "ninguno",
+        "no tenemos restricciones",
+        "no hay restricciones",
+        "ninguna restricción",
+        "nada especial",
+        "sin restricciones",
+    }
+
+    if normalized in no_restrictions_phrases:
+        return [], True
+
+    return None, None
 
 def _recommendations_reply(recommendations: list[Recommendation]) -> str:
     top = recommendations[:3]
@@ -469,15 +499,24 @@ def _suggested_actions(
     context: AgentContext,
     state: ConversationState,
 ) -> list[SuggestedAction]:
-    actions = [
-        SuggestedAction(
-            label="Iniciar salida",
-            type="navigate",
-            payload={"route": "/plans/create"},
-        ),
-    ]
+    if state.missing_fields:
+        suggested_actions = [
+            SuggestedAction(
+                label="Iniciar salida",
+                type="navigate",
+                payload={"route": "/plans/create"},
+            )
+        ]
+    else:
+        suggested_actions = [
+            SuggestedAction(
+                label="Ver recomendaciones",
+                type="navigate",
+                payload={"route": "/recommendations"},
+            )
+        ]
     if state.stage == "ready_for_recommendations":
-        actions.append(
+        suggested_actions.append(
             SuggestedAction(
                 label="Calcular recomendaciones",
                 type="submit",
@@ -485,14 +524,14 @@ def _suggested_actions(
             )
         )
     if payload.plan_id is not None or context.recommendations:
-        actions.append(
+        suggested_actions.append(
             SuggestedAction(
                 label="Ver recomendaciones",
                 type="navigate",
                 payload={"route": "/recommendations", "plan_id": payload.plan_id},
             )
         )
-    return actions
+    return suggested_actions
 
 
 def _log_llm_error(error_type: str, exc: Exception, started_at: float) -> None:
@@ -606,17 +645,21 @@ def _extract_music(text: str) -> list[str]:
     return [tag for tag in tags if tag in text]
 
 
-def _extract_restrictions(text: str) -> list[str]:
-    if "sin restricciones" in text:
-        return ["sin restricciones"]
-    restrictions = []
+def _extract_restrictions(text: str) -> tuple[list[str], bool | None]:
+    if "sin restricciones" in text or "no hay restricciones" in text:
+        return [], True
+
+    restrictions: list[str] = []
     if "sin fumar" in text:
         restrictions.append("sin fumar")
     if "evitar" in text:
         restrictions.append("lugares a evitar")
     if "edad" in text:
         restrictions.append("restricción de edad")
-    return restrictions
+
+    if restrictions:
+        return restrictions, True
+    return [], None
 
 
 def _merge_lists(existing: object, incoming: list[str]) -> list[str]:

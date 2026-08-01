@@ -29,7 +29,8 @@ class ConversationState(ApiModel):
     meeting_point: str | None = None
     outing_type: str | None = None
     music_preferences: list[str] = Field(default_factory=list)
-    restrictions: list[str] = Field(default_factory=list)
+    restrictions: list[str] | None = None
+    restrictions_confirmed: bool = False
     missing_fields: list[str] = Field(default_factory=list)
     stage: ConversationStage = "collecting"
 
@@ -53,7 +54,8 @@ class ExtractedConversationData(ApiModel):
     meeting_point: str | None = None
     outing_type: str | None = None
     music_preferences: list[str] = Field(default_factory=list)
-    restrictions: list[str] = Field(default_factory=list)
+    restrictions: list[str] | None = None
+    restrictions_confirmed: bool | None = None 
 
     @field_validator("origin_zones", "music_preferences", "restrictions", mode="before")
     @classmethod

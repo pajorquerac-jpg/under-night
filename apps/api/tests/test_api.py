@@ -1,5 +1,4 @@
 from datetime import UTC, date, datetime, time
-
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -7,7 +6,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.conversation import ConversationMessage
-
+from app.schemas.conversation import ConversationState
+from app.services.conversation_agent import _missing_fields
 
 def create_plan(client: TestClient) -> int:
     response = client.post(
@@ -89,6 +89,60 @@ def test_over_budget_venue_is_penalized(client: TestClient) -> None:
     economy = next(item for item in response.json() if item["venue"]["name"] == "Economico Centro")
     assert premium["all_within_budget"] is False
     assert premium["score"] < economy["score"]
+
+
+def test_empty_confirmed_restrictions_are_not_missing() -> None:
+    state = ConversationState(
+        people_count=4,
+        budget_per_person=25000,
+        event_date="2026-08-08",
+        origin_zones=["Ñuñoa", "Providencia"],
+        outing_type="bailar",
+        music_preferences=["electrónica", "pop"],
+        restrictions=[],
+        restrictions_confirmed=True,
+    )
+
+    missing = _missing_fields(state)
+
+    assert "restrictions" not in missing
+
+def test_unconfirmed_restrictions_are_missing() -> None:
+    state = ConversationState(
+        people_count=4,
+        budget_per_person=25000,
+        event_date="2026-08-08",
+        origin_zones=["Ñuñoa"],
+        outing_type="bailar",
+        music_preferences=["electrónica"],
+        restrictions=[],
+        restrictions_confirmed=False,
+    )
+
+    missing = _missing_fields(state)
+
+    assert "restrictions" in missing
+
+
+def test_agent_confirms_no_restrictions(client: TestClient) -> None:
+    response = client.post(
+        "/api/v1/agent/chat",
+        json={
+            "message": (
+                "Somos cuatro, tenemos 25 mil pesos cada uno, queremos bailar, "
+                "salimos desde Centro, es el viernes, música pop y sin restricciones"
+            ),
+            "use_llm": False,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"]["restrictions"] == []
+    assert body["state"]["restrictions_confirmed"] is True
+    assert response.json()["state"]["restrictions"] == []
+    assert response.json()["state"]["restrictions_confirmed"] is True
+    assert "restrictions" not in response.json()["state"]["missing_fields"]
 
 
 class FakeOllamaResponse:
