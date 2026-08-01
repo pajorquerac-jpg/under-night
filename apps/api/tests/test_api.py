@@ -3,6 +3,10 @@ from datetime import UTC, date, datetime, time
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.models.conversation import ConversationMessage
 
 
 def create_plan(client: TestClient) -> int:
@@ -164,6 +168,10 @@ def test_agent_chat_uses_ollama_success(
     assert "comunas" in body["reply"]
     assert "internal reasoning" not in body["reply"]
     assert "</think>" not in body["reply"]
+    assert body["state"]["people_count"] == 4
+    assert body["state"]["budget_per_person"] == 25000
+    assert body["state"]["outing_type"] == "bailar"
+    assert body["state"]["missing_fields"][0] == "origin_zones"
 
 
 def test_agent_chat_ollama_timeout_uses_fallback(
@@ -219,6 +227,79 @@ def test_agent_chat_incomplete_message_collects_data_without_venues(client: Test
     assert "Economico Centro" not in body["reply"]
     assert "Premium Oriente" not in body["reply"]
     assert body["suggested_actions"][0]["label"] == "Iniciar salida"
+
+
+def test_agent_chat_guards_internal_reasoning_from_ollama(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    use_fake_ollama(
+        monkeypatch,
+        payload={
+            "message": {
+                "content": (
+                    "Okay, the user gave people, budget and type. "
+                    "I need to ask for missing_fields now."
+                )
+            }
+        },
+    )
+
+    response = client.post(
+        "/api/v1/agent/chat",
+        json={
+            "message": "Somos cuatro, tenemos 25 mil pesos cada uno y queremos bailar",
+            "conversation": [],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["provider"] == "ollama"
+    assert body["used_fallback"] is False
+    assert body["reply"] == "¿Desde qué comunas sale cada persona, o se juntan todos en un punto?"
+
+
+def test_agent_chat_continues_conversation_state_and_persists_messages(
+    client: TestClient,
+    db: Session,
+) -> None:
+    first = client.post(
+        "/api/v1/agent/chat",
+        json={
+            "message": "Somos cuatro, tenemos 25 mil pesos cada uno y queremos bailar",
+            "use_llm": False,
+        },
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+    conversation_id = first_body["conversation_id"]
+    assert first_body["state"]["people_count"] == 4
+    assert first_body["state"]["budget_per_person"] == 25000
+    assert first_body["state"]["missing_fields"][0] == "origin_zones"
+
+    second = client.post(
+        "/api/v1/agent/chat",
+        json={
+            "conversation_id": conversation_id,
+            "message": "Salimos desde Providencia y Ñuñoa",
+            "use_llm": False,
+        },
+    )
+
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["conversation_id"] == conversation_id
+    assert second_body["state"]["people_count"] == 4
+    assert second_body["state"]["budget_per_person"] == 25000
+    assert second_body["state"]["origin_zones"] == ["Providencia", "Ñuñoa"]
+
+    messages = db.scalars(
+        select(ConversationMessage)
+        .where(ConversationMessage.conversation_id == conversation_id)
+        .order_by(ConversationMessage.id)
+    ).all()
+    assert [message.role for message in messages] == ["user", "assistant", "user", "assistant"]
 
 
 def test_agent_chat_invalid_ollama_response_uses_fallback(
