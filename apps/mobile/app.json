@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "UnderNight",
+    "slug": "undernight",
+    "scheme": "undernight",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "androidNavigationBar": {
+      "backgroundColor": "#000000",
+      "barStyle": "light-content"
+    },
+    "androidStatusBar": {
+      "backgroundColor": "#000000",
+      "barStyle": "light-content",
+      "translucent": false
+    },
+    "assetBundlePatterns": ["**/*"],
+    "plugins": ["expo-router"],
+    "ios": {
+      "infoPlist": {
+        "UIViewControllerBasedStatusBarAppearance": true
+      }
+    },
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

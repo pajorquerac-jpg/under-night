@@ -1,0 +1,17 @@
+.env
+.DS_Store
+node_modules/
+.expo/
+dist/
+build/
+coverage/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+htmlcov/
+*.db
+postgres-data/
