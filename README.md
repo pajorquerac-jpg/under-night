@@ -14,6 +14,12 @@ flowchart TD
 
 El monorepo separa la aplicacion movil (`apps/mobile`), la API (`apps/api`) y la infraestructura (`infrastructure`). La comunicacion entre mobile y backend es REST con JSON.
 
+## Documentacion del MVP
+
+- [Informe tecnico y funcional](docs/mvp-report.md)
+- [Diagramas de arquitectura](docs/diagrams.md)
+- [Guion de presentacion](docs/presentation-outline.md)
+
 ## Requisitos
 
 - Docker y Docker Compose.
