@@ -1,8 +1,10 @@
 from typing import Literal
-
+from datetime import date 
 from pydantic import AliasChoices, Field, field_validator
 
 from app.schemas.common import ApiModel
+
+
 
 ChatRole = Literal["system", "user", "assistant"]
 
@@ -24,7 +26,9 @@ ConversationStage = Literal["collecting", "ready_for_recommendations"]
 class ConversationState(ApiModel):
     people_count: int | None = Field(default=None, ge=1, le=50)
     budget_per_person: int | None = Field(default=None, ge=0)
-    event_date: str | None = None
+    event_date: date | None = None
+    event_date_text: str | None = None
+    event_date_needs_confirmation: bool = False
     origin_zones: list[str] = Field(default_factory=list)
     meeting_point: str | None = None
     outing_type: str | None = None
@@ -49,7 +53,9 @@ class ConversationState(ApiModel):
 class ExtractedConversationData(ApiModel):
     people_count: int | None = Field(default=None, ge=1, le=50)
     budget_per_person: int | None = Field(default=None, ge=0)
-    event_date: str | None = None
+    event_date: date | None = None
+    event_date_text: str | None = None
+    event_date_needs_confirmation: bool = False
     origin_zones: list[str] = Field(default_factory=list)
     meeting_point: str | None = None
     outing_type: str | None = None

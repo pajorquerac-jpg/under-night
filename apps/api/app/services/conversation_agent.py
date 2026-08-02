@@ -28,6 +28,10 @@ from app.schemas.conversation import (
     SuggestedAction,
 )
 
+from datetime import date
+
+from app.services.date_normalizer import normalize_event_date
+
 logger = logging.getLogger(__name__)
 
 
@@ -61,6 +65,7 @@ async def answer_chat(db: Session, payload: AgentChatRequest) -> AgentChatRespon
     )
 
     extracted = await _extract_data(payload, request_history)
+    extracted = _override_restrictions_from_message(extracted, payload.message)
     merged_state = _merge_state(current_state, extracted)
     updated_state = _finalize_state(merged_state)
     update_conversation_state(
@@ -105,6 +110,7 @@ async def _extract_data(
         )
         try:
             extracted = await _ask_ollama_for_extraction(payload, history)
+            extracted = _override_date_extraction_from_message(extracted, payload.message)
             duration_ms = round((time.perf_counter() - started_at) * 1000)
             logger.info(
                 "agent.extract_success provider=ollama model=%s duration_ms=%s",
@@ -196,8 +202,7 @@ async def _ask_ollama_for_reply(
     history: list[ChatMessage],
     state: ConversationState,
 ) -> str:
-    next_field = state.missing_fields[0] if state.missing_fields else None
-    next_question = _collection_question(next_field) if next_field is not None else None
+    next_question = _next_question(state)
     messages = [
         {"role": "system", "content": _reply_prompt(state)},
         *[_message_to_ollama(message) for message in history[-10:]],
@@ -303,8 +308,18 @@ def _extraction_prompt() -> str:
             "Extrae datos estructurados para UnderNight.",
             "Responde sólo JSON válido, sin markdown y sin explicación.",
             "Usa estas claves exactas:",
-            "people_count, budget_per_person, event_date, origin_zones,",
-            "meeting_point, outing_type, music_preferences, restrictions.",
+            "people_count, budget_per_person, event_date, event_date_text,",
+            "event_date_needs_confirmation, origin_zones, meeting_point,",
+            "outing_type, music_preferences, restrictions, restrictions_confirmed.",
+            "Para fechas:",
+            "- Copia la expresión temporal del usuario en event_date_text.",
+            "- No conviertas expresiones relativas a fecha ISO.",
+            "- No inventes anio, mes ni dia.",
+            "- El backend resolvera la fecha.",
+            "Ejemplos:",
+            "Usuario: Queremos salir este sabado -> event_date_text: este sabado",
+            "Usuario: El 8 de agosto -> event_date_text: 8 de agosto",
+            "Usuario: Todavia no sabemos -> event_date_text: null",
             "Si un dato no aparece, usa null para escalares y [] para listas.",
             "No inventes datos.",
         ]
@@ -312,8 +327,7 @@ def _extraction_prompt() -> str:
 
 
 def _reply_prompt(state: ConversationState) -> str:
-    next_field = state.missing_fields[0] if state.missing_fields else None
-    next_question = _collection_question(next_field) if next_field is not None else None
+    next_question = _next_question(state)
     return "\n".join(
         [
             "/no_think",
@@ -332,10 +346,16 @@ def _reply_prompt(state: ConversationState) -> str:
 
 
 def _guard_conversational_reply(reply: str, state: ConversationState) -> str:
+    if _looks_like_internal_reasoning(reply):
+        if not state.missing_fields:
+            return (
+                "Perfecto, ya tengo la información base. "
+                "Cuando quieras, calculamos recomendaciones."
+            )
+        return _next_question(state) or _collection_question(state.missing_fields[0])
+
     if not state.missing_fields:
         return reply
-    if _looks_like_internal_reasoning(reply):
-        return _collection_question(state.missing_fields[0])
     return reply
 
 
@@ -364,7 +384,12 @@ def _merge_state(
             value = value.get("restrictions", [])
             if "restrictions_confirmed" in value:
                 value = value.get("restrictions_confirmed", False)
-        
+        if key == "event_date_text" and isinstance(value, str):
+            result = normalize_event_date(
+                value, reference_date=date.today()
+            )
+            data["event_date"] = result.normalized_date
+            data["event_date_needs_confirmation"] = result.needs_confirmation
         if value is None:
             continue
         if isinstance(value, list):
@@ -372,6 +397,10 @@ def _merge_state(
                 data[key] = _merge_lists(data.get(key, []), value)
             continue
         data[key] = value
+
+    if data.get("event_date") is not None:
+        data["event_date_needs_confirmation"] = False
+
     return ConversationState.model_validate(data)
 
 
@@ -400,6 +429,9 @@ def _missing_fields(state: ConversationState) -> list[str]:
     if not state.restrictions_confirmed:
         missing.append("restrictions")
 
+    if state.event_date_needs_confirmation and "event_date" in missing:
+        return ["event_date", *[field for field in missing if field != "event_date"]]
+
     if (
         "origin_zones" in missing
         and "people_count" not in missing
@@ -419,7 +451,7 @@ def _fallback_reply(
         return _recommendations_reply(context.recommendations)
 
     if state.missing_fields:
-        return _collection_question(state.missing_fields[0])
+        return _next_question(state) or _collection_question(state.missing_fields[0])
 
     
 
@@ -432,9 +464,20 @@ def _fallback_reply(
 def _rule_extract(message: str) -> ExtractedConversationData:
     text = message.lower()
     restrictions, restrictions_confirmed = _extract_restrictions(text)
+    event_date = _extract_date(text)
+    event_date_text = _extract_date_text(text)
+
+    event_date_needs_confirmation = False
+    if event_date_text is not None:
+        normalized = normalize_event_date(event_date_text, reference_date=date.today())
+        event_date = event_date or normalized.normalized_date
+        event_date_needs_confirmation = normalized.needs_confirmation
+
     return ExtractedConversationData(
         budget_per_person=_extract_budget(text),
-        event_date=_extract_date(text),
+        event_date=event_date,
+        event_date_text=event_date_text,
+        event_date_needs_confirmation=event_date_needs_confirmation,
         meeting_point=_extract_meeting_point(message),
         music_preferences=_extract_music(text),
         origin_zones=_extract_origins(message),
@@ -443,6 +486,48 @@ def _rule_extract(message: str) -> ExtractedConversationData:
         restrictions=restrictions,
         restrictions_confirmed=restrictions_confirmed,
     )
+
+
+def _override_date_extraction_from_message(
+    extracted: ExtractedConversationData,
+    message: str,
+) -> ExtractedConversationData:
+    text = message.lower()
+    event_date_text = _extract_date_text(text)
+    event_date = _extract_date(text)
+
+    if event_date_text is None and event_date is None:
+        return extracted
+
+    updates: dict[str, object] = {}
+    if event_date_text is not None:
+        normalized = normalize_event_date(event_date_text, reference_date=date.today())
+        updates["event_date_text"] = event_date_text
+        updates["event_date_needs_confirmation"] = normalized.needs_confirmation
+        if normalized.normalized_date is not None:
+            updates["event_date"] = normalized.normalized_date
+    if event_date is not None:
+        updates["event_date"] = event_date
+        updates["event_date_needs_confirmation"] = False
+
+    return extracted.model_copy(update=updates)
+
+
+def _override_restrictions_from_message(
+    extracted: ExtractedConversationData,
+    message: str,
+) -> ExtractedConversationData:
+    restrictions, restrictions_confirmed = extract_restrictions_confirmation(message)
+    updates: dict[str, object] = {}
+
+    if restrictions is not None:
+        updates["restrictions"] = restrictions
+    if restrictions_confirmed is not None:
+        updates["restrictions_confirmed"] = restrictions_confirmed
+
+    if not updates:
+        return extracted
+    return extracted.model_copy(update=updates)
 
 
 def _collection_question(field: str) -> str:
@@ -460,6 +545,19 @@ def _collection_question(field: str) -> str:
     return questions[field]
 
 
+def _next_question(state: ConversationState) -> str | None:
+    if not state.missing_fields:
+        return None
+
+    next_field = state.missing_fields[0]
+    if next_field == "event_date" and state.event_date_needs_confirmation and state.event_date_text:
+        result = normalize_event_date(state.event_date_text, reference_date=date.today())
+        if result.clarification:
+            return result.clarification
+
+    return _collection_question(next_field)
+
+
 def extract_restrictions_confirmation(message: str) -> tuple[list[str] | None, bool | None]:
     normalized = message.strip().lower()
 
@@ -475,6 +573,9 @@ def extract_restrictions_confirmation(message: str) -> tuple[list[str] | None, b
     }
 
     if normalized in no_restrictions_phrases:
+        return [], True
+
+    if any(phrase in normalized for phrase in no_restrictions_phrases if " " in phrase):
         return [], True
 
     return None, None
@@ -500,13 +601,7 @@ def _suggested_actions(
     state: ConversationState,
 ) -> list[SuggestedAction]:
     if state.missing_fields:
-        suggested_actions = [
-            SuggestedAction(
-                label="Iniciar salida",
-                type="navigate",
-                payload={"route": "/plans/create"},
-            )
-        ]
+        suggested_actions = []
     else:
         suggested_actions = [
             SuggestedAction(
@@ -586,10 +681,37 @@ def _extract_budget(text: str) -> int | None:
     return None
 
 
-def _extract_date(text: str) -> str | None:
-    explicit = re.search(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}\b", text)
-    if explicit is not None:
-        return explicit.group(0)
+def _extract_date(text: str) -> date | None:
+    iso_match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", text)
+    if iso_match is None:
+        return None
+    try:
+        return date.fromisoformat(iso_match.group(0))
+    except ValueError:
+        return None
+
+
+def _extract_date_text(text: str) -> str | None:
+    iso_match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", text)
+    if iso_match is not None:
+        return iso_match.group(0)
+
+    weekday_phrase_match = re.search(
+        r"\b(?:hoy|este|proximo|próximo|el\s+proximo|el\s+próximo|el\s+este)\s+"
+        r"(?:lunes|martes|mi[eé]rcoles|jueves|viernes|s[áa]bado|domingo)\b",
+        text,
+    )
+    if weekday_phrase_match is not None:
+        return weekday_phrase_match.group(0)
+
+    day_month_match = re.search(r"\b\d{1,2}\s+de\s+[a-záéíóúñ]+\b", text)
+    if day_month_match is not None:
+        return day_month_match.group(0)
+
+    day_slash_month_match = re.search(r"\b\d{1,2}/\d{1,2}\b", text)
+    if day_slash_month_match is not None:
+        return day_slash_month_match.group(0)
+
     for word in (
         "hoy",
         "mañana",

@@ -9,6 +9,9 @@ from app.models.conversation import ConversationMessage
 from app.schemas.conversation import ConversationState
 from app.services.conversation_agent import _missing_fields
 
+
+
+
 def create_plan(client: TestClient) -> int:
     response = client.post(
         "/api/v1/plans",
@@ -280,7 +283,7 @@ def test_agent_chat_incomplete_message_collects_data_without_venues(client: Test
     assert "comunas" in body["reply"]
     assert "Economico Centro" not in body["reply"]
     assert "Premium Oriente" not in body["reply"]
-    assert body["suggested_actions"][0]["label"] == "Iniciar salida"
+    assert body["suggested_actions"] == []
 
 
 def test_agent_chat_guards_internal_reasoning_from_ollama(
