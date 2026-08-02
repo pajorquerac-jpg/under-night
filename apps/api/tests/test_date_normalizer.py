@@ -2,13 +2,22 @@ from datetime import date
 
 from app.services.date_normalizer import normalize_event_date
 
-
 REFERENCE_DATE = date(2026, 8, 1)
 
 
 def test_normalizes_today() -> None:
     result = normalize_event_date(
         "hoy",
+        reference_date=REFERENCE_DATE,
+    )
+
+    assert result.normalized_date == date(2026, 8, 1)
+    assert result.needs_confirmation is False
+
+
+def test_normalizes_today_with_weekday() -> None:
+    result = normalize_event_date(
+        "hoy sábado",
         reference_date=REFERENCE_DATE,
     )
 

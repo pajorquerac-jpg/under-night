@@ -1,8 +1,10 @@
 from datetime import UTC, date, datetime, time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, HTTPException, status
 
 from app.api.dependencies import DbSession
+from app.core.config import settings
 from app.repositories.participants import create_participant
 from app.repositories.plans import create_plan
 from app.schemas.night_out import FriendQuestionnaire, NightOutQuestionnaire
@@ -33,9 +35,9 @@ def create_from_questionnaire(
         db,
         PlanCreate(
             decision_deadline=datetime.now(UTC),
-            event_date=date.today(),
+            event_date=_today(),
             name=payload.plan_name,
-            plan_type=", ".join(friend.outing_type for friend in payload.friends),
+            plan_type=_plan_type_from_friends(payload.friends),
             preferred_zone=payload.preferred_zone,
             start_time=time(22, 0),
         ),
@@ -45,6 +47,26 @@ def create_from_questionnaire(
         create_participant(db, plan.id, _participant_from_friend(friend, payload))
 
     return generate_recommendations(db, plan.id)
+
+
+def _today() -> date:
+    try:
+        return datetime.now(ZoneInfo(settings.app_timezone)).date()
+    except ZoneInfoNotFoundError:
+        return date.today()
+
+
+def _plan_type_from_friends(friends: list[FriendQuestionnaire]) -> str:
+    values: list[str] = []
+    for friend in friends:
+        outing_type = friend.outing_type.strip()
+        if outing_type and outing_type not in values:
+            values.append(outing_type)
+
+    plan_type = ", ".join(values) or "salida nocturna"
+    if len(plan_type) <= 80:
+        return plan_type
+    return f"{plan_type[:77].rstrip(', ')}..."
 
 
 def _participant_from_friend(

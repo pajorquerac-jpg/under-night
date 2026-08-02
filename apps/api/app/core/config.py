@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")
     api_port: int = Field(default=8000, alias="API_PORT")
     environment: str = Field(default="development", alias="ENVIRONMENT")
+    app_timezone: str = Field(default="America/Santiago", alias="APP_TIMEZONE")
     cors_origins: str = Field(
         default="http://localhost:19006,http://localhost:8081,exp://127.0.0.1:8081",
         alias="CORS_ORIGINS",

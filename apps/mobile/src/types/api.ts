@@ -61,6 +61,7 @@ export type ParticipantCost = {
   total_cost: string;
   remaining_budget: string;
   within_budget: boolean;
+  participant: Participant;
 };
 
 export type Recommendation = {
@@ -104,4 +105,58 @@ export type PlanDraft = {
   planType: string;
   preferredZone: string;
   decisionDeadline: string;
+};
+
+export type AgentParticipant = {
+  name: string | null;
+  budget: number | null;
+  origin_zone: string | null;
+};
+
+export type ChatRole = "user" | "assistant";
+
+export type ChatMessage = {
+  id: string;
+  role: ChatRole;
+  content: string;
+  createdAt: string;
+  status?: "sending" | "sent" | "error";
+};
+
+export type AgentConversationState = {
+  people_count: number | null;
+  budget_per_person: number | null;
+  participants: AgentParticipant[];
+  event_date: string | null;
+  event_date_text: string | null;
+  event_date_needs_confirmation: boolean;
+  origin_zones: string[];
+  meeting_point: string | null;
+  outing_type: string | null;
+  music_preferences: string[];
+  restrictions: string[];
+  restrictions_confirmed: boolean;
+  missing_fields: string[];
+  stage: string;
+};
+
+export type SuggestedAction = {
+  label: string;
+  type: string;
+  payload: Record<string, unknown>;
+};
+
+export type AgentChatRequest = {
+  message: string;
+  conversation_id?: string;
+};
+
+export type AgentChatResponse = {
+  conversation_id: string;
+  reply: string;
+  provider: string;
+  model: string | null;
+  state: AgentConversationState;
+  used_fallback: boolean;
+  suggested_actions: SuggestedAction[];
 };

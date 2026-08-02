@@ -5,6 +5,8 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from datetime import date, datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from sqlalchemy.orm import Session
@@ -23,13 +25,11 @@ from app.schemas.conversation import (
     AgentChatRequest,
     AgentChatResponse,
     ChatMessage,
+    ConversationParticipant,
     ConversationState,
     ExtractedConversationData,
     SuggestedAction,
 )
-
-from datetime import date
-
 from app.services.date_normalizer import normalize_event_date
 
 logger = logging.getLogger(__name__)
@@ -308,9 +308,10 @@ def _extraction_prompt() -> str:
             "Extrae datos estructurados para UnderNight.",
             "Responde sólo JSON válido, sin markdown y sin explicación.",
             "Usa estas claves exactas:",
-            "people_count, budget_per_person, event_date, event_date_text,",
+            "people_count, budget_per_person, participants, event_date, event_date_text,",
             "event_date_needs_confirmation, origin_zones, meeting_point,",
             "outing_type, music_preferences, restrictions, restrictions_confirmed.",
+            "participants debe ser una lista de objetos con name, budget y origin_zone.",
             "Para fechas:",
             "- Copia la expresión temporal del usuario en event_date_text.",
             "- No conviertas expresiones relativas a fecha ISO.",
@@ -386,11 +387,15 @@ def _merge_state(
                 value = value.get("restrictions_confirmed", False)
         if key == "event_date_text" and isinstance(value, str):
             result = normalize_event_date(
-                value, reference_date=date.today()
+                value, reference_date=_today()
             )
             data["event_date"] = result.normalized_date
             data["event_date_needs_confirmation"] = result.needs_confirmation
         if value is None:
+            continue
+        if key == "participants" and isinstance(value, list):
+            if value:
+                data[key] = _merge_participants(data.get(key, []), value)
             continue
         if isinstance(value, list):
             if value:
@@ -406,6 +411,12 @@ def _merge_state(
 
 def _finalize_state(state: ConversationState) -> ConversationState:
     data = state.model_dump()
+    if state.participants and (
+        state.people_count is None or len(state.participants) > state.people_count
+    ):
+        data["people_count"] = len(state.participants)
+        state = ConversationState.model_validate(data)
+
     missing = _missing_fields(state)
     data["missing_fields"] = missing
     data["stage"] = "ready_for_recommendations" if not missing else "collecting"
@@ -416,11 +427,15 @@ def _missing_fields(state: ConversationState) -> list[str]:
     missing: list[str] = []
     if state.people_count is None:
         missing.append("people_count")
-    if state.budget_per_person is None:
+    if state.budget_per_person is None and not _has_participant_budgets(state):
         missing.append("budget_per_person")
     if state.event_date is None:
         missing.append("event_date")
-    if not state.origin_zones and state.meeting_point is None:
+    if (
+        not state.origin_zones
+        and state.meeting_point is None
+        and not _has_participant_origins(state)
+    ):
         missing.append("origin_zones")
     if state.outing_type is None:
         missing.append("outing_type")
@@ -466,15 +481,23 @@ def _rule_extract(message: str) -> ExtractedConversationData:
     restrictions, restrictions_confirmed = _extract_restrictions(text)
     event_date = _extract_date(text)
     event_date_text = _extract_date_text(text)
+    participants = _extract_participants(message)
+    participant_budgets = [
+        participant.budget for participant in participants if participant.budget is not None
+    ]
 
     event_date_needs_confirmation = False
     if event_date_text is not None:
-        normalized = normalize_event_date(event_date_text, reference_date=date.today())
+        normalized = normalize_event_date(event_date_text, reference_date=_today())
         event_date = event_date or normalized.normalized_date
         event_date_needs_confirmation = normalized.needs_confirmation
 
+    budget_per_person = (
+        min(participant_budgets) if participant_budgets else _extract_budget(text)
+    )
+
     return ExtractedConversationData(
-        budget_per_person=_extract_budget(text),
+        budget_per_person=budget_per_person,
         event_date=event_date,
         event_date_text=event_date_text,
         event_date_needs_confirmation=event_date_needs_confirmation,
@@ -482,7 +505,8 @@ def _rule_extract(message: str) -> ExtractedConversationData:
         music_preferences=_extract_music(text),
         origin_zones=_extract_origins(message),
         outing_type=_extract_outing_type(text),
-        people_count=_extract_people_count(text),
+        participants=participants,
+        people_count=_extract_people_count(text) or (len(participants) if participants else None),
         restrictions=restrictions,
         restrictions_confirmed=restrictions_confirmed,
     )
@@ -501,7 +525,7 @@ def _override_date_extraction_from_message(
 
     updates: dict[str, object] = {}
     if event_date_text is not None:
-        normalized = normalize_event_date(event_date_text, reference_date=date.today())
+        normalized = normalize_event_date(event_date_text, reference_date=_today())
         updates["event_date_text"] = event_date_text
         updates["event_date_needs_confirmation"] = normalized.needs_confirmation
         if normalized.normalized_date is not None:
@@ -551,7 +575,7 @@ def _next_question(state: ConversationState) -> str | None:
 
     next_field = state.missing_fields[0]
     if next_field == "event_date" and state.event_date_needs_confirmation and state.event_date_text:
-        result = normalize_event_date(state.event_date_text, reference_date=date.today())
+        result = normalize_event_date(state.event_date_text, reference_date=_today())
         if result.clarification:
             return result.clarification
 
@@ -578,7 +602,32 @@ def extract_restrictions_confirmation(message: str) -> tuple[list[str] | None, b
     if any(phrase in normalized for phrase in no_restrictions_phrases if " " in phrase):
         return [], True
 
+    place_restriction = _extract_place_restriction(normalized)
+    if place_restriction is not None:
+        return [place_restriction], True
+
     return None, None
+
+
+def _extract_place_restriction(text: str) -> str | None:
+    if not re.search(r"\b(?:solo|s[oó]lo|unicamente|únicamente|solamente)\b", text):
+        return None
+
+    zone_match = re.search(
+        r"\b(?:sector|zona|lugares?\s+(?:del|de la)\s+(?:sector|zona)?)\s+"
+        r"(oriente|centro|norte|sur|providencia|santiago|ñuñoa|nunoa|las condes|recoleta)\b",
+        text,
+    )
+    if zone_match is None:
+        zone_match = re.search(
+            r"\b(oriente|centro|norte|sur|providencia|santiago|ñuñoa|nunoa|las condes|recoleta)\b",
+            text,
+        )
+    if zone_match is None:
+        return None
+
+    zone = zone_match.group(1).replace("nunoa", "ñuñoa")
+    return f"solo lugares en {zone}"
 
 def _recommendations_reply(recommendations: list[Recommendation]) -> str:
     top = recommendations[:3]
@@ -600,20 +649,11 @@ def _suggested_actions(
     context: AgentContext,
     state: ConversationState,
 ) -> list[SuggestedAction]:
-    if state.missing_fields:
-        suggested_actions = []
-    else:
-        suggested_actions = [
-            SuggestedAction(
-                label="Ver recomendaciones",
-                type="navigate",
-                payload={"route": "/recommendations"},
-            )
-        ]
+    suggested_actions: list[SuggestedAction] = []
     if state.stage == "ready_for_recommendations":
         suggested_actions.append(
             SuggestedAction(
-                label="Calcular recomendaciones",
+                label="Ver recomendaciones",
                 type="submit",
                 payload={"conversation_id": conversation_id},
             )
@@ -646,6 +686,29 @@ def _asks_for_recommendations(message: str) -> bool:
     return any(word in normalized for word in ("recom", "lugar", "opción", "opcion", "ranking"))
 
 
+def _today() -> date:
+    try:
+        return datetime.now(ZoneInfo(settings.app_timezone)).date()
+    except ZoneInfoNotFoundError:
+        return date.today()
+
+
+def _has_participant_budgets(state: ConversationState) -> bool:
+    if state.people_count is None:
+        return False
+    budget_count = sum(1 for participant in state.participants if participant.budget is not None)
+    return budget_count >= state.people_count
+
+
+def _has_participant_origins(state: ConversationState) -> bool:
+    if state.people_count is None:
+        return False
+    origin_count = sum(
+        1 for participant in state.participants if participant.origin_zone is not None
+    )
+    return origin_count >= state.people_count
+
+
 def _extract_people_count(text: str) -> int | None:
     words = {
         "dos": 2,
@@ -668,17 +731,154 @@ def _extract_people_count(text: str) -> int | None:
     match = re.search(r"\b(\d{1,2})\s+personas?\b", text)
     if match is not None:
         return int(match.group(1))
+
+    names_match = re.search(
+        r"\bsomos\s+(.+?)(?:\.|,?\s+(?:tenemos|queremos|salimos|vamos|el|la)\b|$)",
+        text,
+    )
+    if names_match is not None:
+        names_text = names_match.group(1)
+        names = [
+            name.strip()
+            for name in re.split(r"\s+y\s+|,", names_text)
+            if name.strip()
+        ]
+        if len(names) >= 2:
+            return len(names)
     return None
+
+
+def _extract_participants(message: str) -> list[ConversationParticipant]:
+    text = message.lower()
+    names = _extract_group_names(message)
+    by_name: dict[str, ConversationParticipant] = {
+        _participant_key(name): ConversationParticipant(name=name) for name in names
+    }
+
+    for name, budget in _extract_named_budgets(message):
+        key = _participant_key(name)
+        current = by_name.get(key, ConversationParticipant(name=name))
+        by_name[key] = current.model_copy(update={"budget": budget})
+
+    for name, origin_zone in _extract_named_origins(message):
+        key = _participant_key(name)
+        current = by_name.get(key, ConversationParticipant(name=name))
+        by_name[key] = current.model_copy(update={"origin_zone": origin_zone})
+
+    if by_name:
+        return list(by_name.values())
+
+    people_count = _extract_people_count(text)
+    budget_values = _extract_budget_values(text)
+    if people_count is None or len(budget_values) < people_count:
+        return []
+
+    return [
+        ConversationParticipant(name=f"Amigo {index + 1}", budget=budget)
+        for index, budget in enumerate(budget_values[:people_count])
+    ]
+
+
+def _extract_group_names(message: str) -> list[str]:
+    match = re.search(
+        r"\bsomos\s+(.+?)(?:\.|,?\s+(?:tenemos|queremos|salimos|vamos|el|la)\b|$)",
+        message,
+        flags=re.I,
+    )
+    if match is None:
+        return []
+
+    names_text = match.group(1)
+    if re.search(r"\b\d+\s+(?:amigos|personas)\b", names_text, flags=re.I):
+        return []
+
+    return [
+        name.strip()
+        for name in re.split(r"\s+y\s+|,", names_text)
+        if name.strip()
+    ]
+
+
+def _extract_named_budgets(message: str) -> list[tuple[str, int]]:
+    explicit_budgets = [
+        (match.group("name").strip(), _money_text_to_int(match.group("amount")))
+        for match in re.finditer(
+            r"\b(?P<name>[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚáéíóúÑñ]+)\s+"
+            r"(?:tiene|tienen|cuenta\s+con|lleva)\s+"
+            r"(?P<amount>\d{1,3}(?:[.,]\d{3})+|\d{4,6}|\d+\s*(?:mil|k))\b",
+            message,
+        )
+    ]
+    shorthand_budgets = [
+        (match.group("name").strip(), _money_text_to_int(match.group("amount")))
+        for match in re.finditer(
+            r"(?:,|\by\b)\s*(?P<name>[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚáéíóúÑñ]+)\s+"
+            r"(?P<amount>\d{1,3}(?:[.,]\d{3})+|\d{4,6}|\d+\s*(?:mil|k))\b",
+            message,
+        )
+    ]
+    return [*explicit_budgets, *shorthand_budgets]
+
+
+def _extract_named_origins(message: str) -> list[tuple[str, str]]:
+    known = _known_zones()
+    zone_pattern = "|".join(re.escape(zone) for zone in known)
+    explicit_origins = [
+        (match.group("name").strip(), _canonical_zone(match.group("zone")))
+        for match in re.finditer(
+            rf"\b(?P<name>[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚáéíóúÑñ]+)\s+"
+            rf"(?:sale|salen|viene|vienen)\s+de\s+(?P<zone>{zone_pattern})\b",
+            message,
+            flags=re.I,
+        )
+    ]
+    shorthand_origins = [
+        (match.group("name").strip(), _canonical_zone(match.group("zone")))
+        for match in re.finditer(
+            rf"(?:,|\by\b)\s*(?P<name>[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚáéíóúÑñ]+)\s+"
+            rf"de\s+(?P<zone>{zone_pattern})\b",
+            message,
+            flags=re.I,
+        )
+    ]
+    return [*explicit_origins, *shorthand_origins]
+
+
+def _participant_key(name: str | None) -> str:
+    if not name:
+        return ""
+    return name.strip().lower()
 
 
 def _extract_budget(text: str) -> int | None:
-    match = re.search(r"\b(\d+)\s*(?:mil|k)\b", text)
+    values = _extract_budget_values(text)
+    if values:
+        return min(values)
+    return None
+
+
+def _extract_budget_values(text: str) -> list[int]:
+    values = [int(match) * 1000 for match in re.findall(r"\b(\d+)\s*(?:mil|k)\b", text)]
+    values.extend(
+        int(match.replace(".", "").replace(",", ""))
+        for match in re.findall(r"\b(\d{1,3}(?:[.,]\d{3})+)\b", text)
+    )
+    values.extend(
+        int(match)
+        for match in re.findall(
+            r"\b(?:presupuestos?\s+(?:son|es)|tiene|tienen|con|para)\s+(\d{4,6})\b",
+            text,
+        )
+    )
+    return values
+
+
+def _money_text_to_int(value: str) -> int:
+    normalized = value.lower().strip()
+    match = re.fullmatch(r"(\d+)\s*(?:mil|k)", normalized)
     if match is not None:
         return int(match.group(1)) * 1000
-    match = re.search(r"\b(\d{1,3}(?:[.,]\d{3})+)\b", text)
-    if match is not None:
-        return int(match.group(1).replace(".", "").replace(",", ""))
-    return None
+    return int(normalized.replace(".", "").replace(",", ""))
 
 
 def _extract_date(text: str) -> date | None:
@@ -731,7 +931,12 @@ def _extract_date_text(text: str) -> str | None:
 
 
 def _extract_origins(message: str) -> list[str]:
-    known = [
+    normalized = message.lower()
+    return [zone for zone in _known_zones() if zone.lower() in normalized]
+
+
+def _known_zones() -> list[str]:
+    return [
         "Centro",
         "Oriente",
         "Norte",
@@ -742,8 +947,14 @@ def _extract_origins(message: str) -> list[str]:
         "Las Condes",
         "Recoleta",
     ]
-    normalized = message.lower()
-    return [zone for zone in known if zone.lower() in normalized]
+
+
+def _canonical_zone(value: str) -> str:
+    normalized = value.lower()
+    for zone in _known_zones():
+        if zone.lower() == normalized:
+            return zone
+    return value.strip()
 
 
 def _extract_meeting_point(message: str) -> str | None:
@@ -764,7 +975,14 @@ def _extract_outing_type(text: str) -> str | None:
 
 def _extract_music(text: str) -> list[str]:
     tags = ["reggaeton", "pop", "house", "techno", "rock", "indie", "latin"]
-    return [tag for tag in tags if tag in text]
+    music = [tag for tag in tags if tag in text]
+    if "reggaetón" in text and "reggaeton" not in music:
+        music.append("reggaeton")
+    if re.search(r"\btech\b", text) and "techno" not in music:
+        music.append("techno")
+    if not music and re.search(r"\b(?:buena\s+m[uú]sica|m[uú]sica\s+variada)\b", text):
+        music.append("pop")
+    return music
 
 
 def _extract_restrictions(text: str) -> tuple[list[str], bool | None]:
@@ -790,6 +1008,25 @@ def _merge_lists(existing: object, incoming: list[str]) -> list[str]:
         if value not in merged:
             merged.append(value)
     return merged
+
+
+def _merge_participants(existing: object, incoming: list[object]) -> list[dict[str, object]]:
+    merged: dict[str, dict[str, object]] = {}
+    anonymous_index = 0
+
+    for participant in [
+        *(existing if isinstance(existing, list) else []),
+        *incoming,
+    ]:
+        parsed = ConversationParticipant.model_validate(participant)
+        payload = parsed.model_dump(exclude_none=True)
+        key = _participant_key(parsed.name)
+        if not key:
+            key = f"__anonymous_{anonymous_index}"
+            anonymous_index += 1
+        merged[key] = {**merged.get(key, {}), **payload}
+
+    return list(merged.values())
 
 
 def _money(value: object) -> str:

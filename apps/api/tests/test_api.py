@@ -1,4 +1,5 @@
 from datetime import UTC, date, datetime, time
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -8,8 +9,6 @@ from sqlalchemy.orm import Session
 from app.models.conversation import ConversationMessage
 from app.schemas.conversation import ConversationState
 from app.services.conversation_agent import _missing_fields
-
-
 
 
 def create_plan(client: TestClient) -> int:
@@ -83,6 +82,96 @@ def test_generate_recommendations(client: TestClient) -> None:
     assert recommendations[0]["score"] >= recommendations[1]["score"]
 
 
+def test_recommendations_include_participant_details(client: TestClient) -> None:
+    plan_id = create_plan(client)
+    participant_id = add_participant(client, plan_id, budget="12000")
+
+    response = client.post(f"/api/v1/plans/{plan_id}/recommendations")
+
+    assert response.status_code == 200
+    cost = response.json()[0]["participant_costs"][0]
+    assert cost["participant_id"] == participant_id
+    assert cost["participant"]["name"] == "Paz"
+    assert cost["participant"]["budget"] == "12000.00"
+
+
+def test_night_out_recommendations_deduplicates_long_plan_type(client: TestClient) -> None:
+    friends = [
+        {
+            "budget": "20000",
+            "consumption_level": "medium",
+            "max_entry_price": "10000",
+            "name": f"Amigo {index + 1}",
+            "origin_zone": "Centro",
+            "outing_type": "bailar reggaeton, reggaeton",
+            "transport_type": "rideshare",
+        }
+        for index in range(8)
+    ]
+
+    response = client.post(
+        "/api/v1/night-out/recommendations",
+        json={
+            "friend_count": len(friends),
+            "friends": friends,
+            "group_mode": "together",
+            "plan_name": "Salida UnderNight",
+            "preferred_zone": "Oriente",
+        },
+    )
+
+    assert response.status_code == 201
+    assert len(response.json()) == 2
+
+
+def test_night_out_recommendations_keep_three_named_participants(client: TestClient) -> None:
+    response = client.post(
+        "/api/v1/night-out/recommendations",
+        json={
+            "friend_count": 3,
+            "friends": [
+                {
+                    "budget": "8000",
+                    "consumption_level": "medium",
+                    "max_entry_price": "10000",
+                    "name": "Pablo",
+                    "origin_zone": "Ñuñoa",
+                    "outing_type": "bar, pop",
+                    "transport_type": "rideshare",
+                },
+                {
+                    "budget": "10000",
+                    "consumption_level": "medium",
+                    "max_entry_price": "10000",
+                    "name": "Isabel",
+                    "origin_zone": "Las Condes",
+                    "outing_type": "bar, pop",
+                    "transport_type": "rideshare",
+                },
+                {
+                    "budget": "15000",
+                    "consumption_level": "medium",
+                    "max_entry_price": "10000",
+                    "name": "Jaime",
+                    "origin_zone": "Providencia",
+                    "outing_type": "bar, pop",
+                    "transport_type": "rideshare",
+                },
+            ],
+            "group_mode": "individual",
+            "plan_name": "Salida UnderNight",
+            "preferred_zone": "Centro",
+        },
+    )
+
+    assert response.status_code == 201
+    names = {
+        cost["participant"]["name"]
+        for cost in response.json()[0]["participant_costs"]
+    }
+    assert names == {"Pablo", "Isabel", "Jaime"}
+
+
 def test_over_budget_venue_is_penalized(client: TestClient) -> None:
     plan_id = create_plan(client)
     add_participant(client, plan_id, budget="12000")
@@ -146,6 +235,204 @@ def test_agent_confirms_no_restrictions(client: TestClient) -> None:
     assert response.json()["state"]["restrictions"] == []
     assert response.json()["state"]["restrictions_confirmed"] is True
     assert "restrictions" not in response.json()["state"]["missing_fields"]
+
+
+def test_agent_confirms_place_restriction(client: TestClient) -> None:
+    first = client.post(
+        "/api/v1/agent/chat",
+        json={
+            "message": (
+                "Somos tres, tenemos 20 mil pesos cada uno, queremos bailar, "
+                "salimos desde Centro, es el viernes y música reggaeton"
+            ),
+            "use_llm": False,
+        },
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+    assert first_body["state"]["missing_fields"] == ["restrictions"]
+
+    second = client.post(
+        "/api/v1/agent/chat",
+        json={
+            "conversation_id": first_body["conversation_id"],
+            "message": "Queremos solo lugares del sector oriente",
+            "use_llm": False,
+        },
+    )
+
+    assert second.status_code == 200
+    body = second.json()
+    assert body["state"]["restrictions"] == ["solo lugares en oriente"]
+    assert body["state"]["restrictions_confirmed"] is True
+    assert "restrictions" not in body["state"]["missing_fields"]
+    assert body["state"]["stage"] == "ready_for_recommendations"
+
+
+def test_agent_extracts_named_group_and_tech_music(client: TestClient) -> None:
+    response = client.post(
+        "/api/v1/agent/chat",
+        json={
+            "message": (
+                "Somos Pablo, Denisse y Martina. Pablo tiene 20 mil y Denisse y "
+                "Martina tienen 25 mil. Queremos salir a bailar Tech. Pablo sale "
+                "de Ñuñoa, Denisse de Las Condes y Martina de Providencia. "
+                "Queremos salir el próximo viernes."
+            ),
+            "use_llm": False,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"]["people_count"] == 3
+    assert body["state"]["budget_per_person"] == 20000
+    assert body["state"]["music_preferences"] == ["techno"]
+    assert body["state"]["origin_zones"] == ["Providencia", "Ñuñoa", "Las Condes"]
+    assert body["state"]["outing_type"] == "bailar"
+    assert body["state"]["missing_fields"] == ["restrictions"]
+
+
+def test_agent_extracts_generic_good_music_and_lowest_budget(client: TestClient) -> None:
+    response = client.post(
+        "/api/v1/agent/chat",
+        json={
+            "message": (
+                "Somos 3 amigos, uno tiene 20 mil y el resto tiene 15 mil. "
+                "Queremos ir a un bar de buena música. Cada un sale desde Providencia"
+            ),
+            "use_llm": False,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"]["people_count"] == 3
+    assert body["state"]["budget_per_person"] == 15000
+    assert body["state"]["music_preferences"] == ["pop"]
+    assert body["state"]["origin_zones"] == ["Providencia"]
+    assert body["state"]["outing_type"] == "bar"
+    assert body["state"]["missing_fields"] == ["event_date", "restrictions"]
+
+
+def test_agent_normalizes_today_with_weekday(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.services.conversation_agent._today", lambda: date(2026, 8, 1))
+
+    response = client.post(
+        "/api/v1/agent/chat",
+        json={
+            "message": (
+                "Somos 3 amigos, los presupuestos son 20mil, 15 mil y 30 mil. "
+                "Queremos ir a un bar de buena música. Todos salimos desde Providencia. "
+                "Para hoy sábado."
+            ),
+            "use_llm": False,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"]["event_date"] == "2026-08-01"
+    assert body["state"]["missing_fields"] == ["restrictions"]
+
+
+def test_agent_extracts_plain_numeric_named_budgets(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.services.conversation_agent._today", lambda: date(2026, 8, 1))
+
+    response = client.post(
+        "/api/v1/agent/chat",
+        json={
+            "message": (
+                "Hola, somos 3 amigos. Pablo tiene 8000, Isabel tiene 10000 "
+                "y Jaime tiene 15000 para salir hoy sábado"
+            ),
+            "use_llm": False,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"]["people_count"] == 3
+    assert body["state"]["budget_per_person"] == 8000
+    assert body["state"]["event_date"] == "2026-08-01"
+    assert body["state"]["participants"] == [
+        {"name": "Pablo", "budget": 8000, "origin_zone": None},
+        {"name": "Isabel", "budget": 10000, "origin_zone": None},
+        {"name": "Jaime", "budget": 15000, "origin_zone": None},
+    ]
+    assert "budget_per_person" not in body["state"]["missing_fields"]
+
+
+def test_agent_extracts_named_participant_budgets_and_origins(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.services.conversation_agent._today", lambda: date(2026, 8, 1))
+
+    response = client.post(
+        "/api/v1/agent/chat",
+        json={
+            "message": (
+                "Somos Pablo, Isabel y Jaime. Pablo tiene 8000, Isabel 10000 "
+                "y Jaime 15000. Pablo sale de Ñuñoa, Isabel de Las Condes "
+                "y Jaime de Providencia. Queremos ir a un bar con reggaetón "
+                "hoy sábado y sin restricciones."
+            ),
+            "use_llm": False,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"]["people_count"] == 3
+    assert body["state"]["budget_per_person"] == 8000
+    assert body["state"]["participants"] == [
+        {"name": "Pablo", "budget": 8000, "origin_zone": "Ñuñoa"},
+        {"name": "Isabel", "budget": 10000, "origin_zone": "Las Condes"},
+        {"name": "Jaime", "budget": 15000, "origin_zone": "Providencia"},
+    ]
+    assert body["state"]["missing_fields"] == []
+    assert body["state"]["stage"] == "ready_for_recommendations"
+
+
+def test_agent_updates_people_count_when_more_participants_are_named(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.services.conversation_agent._today", lambda: date(2026, 8, 1))
+
+    first = client.post(
+        "/api/v1/agent/chat",
+        json={"message": "Somos 2 amigos", "use_llm": False},
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        "/api/v1/agent/chat",
+        json={
+            "conversation_id": first.json()["conversation_id"],
+            "message": (
+                "Pablo tiene 8000, Isabel tiene 10000 y Jaime tiene 15000. "
+                "Queremos bar con música variada hoy sábado y sin restricciones."
+            ),
+            "use_llm": False,
+        },
+    )
+
+    assert second.status_code == 200
+    body = second.json()
+    assert body["state"]["people_count"] == 3
+    assert [participant["name"] for participant in body["state"]["participants"]] == [
+        "Pablo",
+        "Isabel",
+        "Jaime",
+    ]
 
 
 class FakeOllamaResponse:

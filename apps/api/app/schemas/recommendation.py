@@ -4,6 +4,7 @@ from decimal import Decimal
 from pydantic import Field
 
 from app.schemas.common import ApiModel
+from app.schemas.participant import ParticipantRead
 from app.schemas.venue import VenueRead
 
 
@@ -17,6 +18,7 @@ class ParticipantCostRead(ApiModel):
     total_cost: Decimal
     remaining_budget: Decimal
     within_budget: bool
+    participant: ParticipantRead
 
 
 class RecommendationRead(ApiModel):

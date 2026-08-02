@@ -8,6 +8,42 @@ from app.models.venue import Venue
 
 VENUES = [
     {
+        "name": "Club Barrio Bajo",
+        "zone": "Oriente",
+        "entry_price": Decimal("0"),
+        "average_drink_price": Decimal("1200"),
+        "music_tags": ["reggaeton", "latin", "pop"],
+        "ambience_tags": ["baile", "casual"],
+        "features": {"demo_role": "viable", "tradeoff": "simple y cercano"},
+        "latitude": Decimal("-33.4258"),
+        "longitude": Decimal("-70.6129"),
+    },
+    {
+        "name": "Patio Economico",
+        "zone": "Centro",
+        "entry_price": Decimal("0"),
+        "average_drink_price": Decimal("900"),
+        "music_tags": ["pop", "latin"],
+        "ambience_tags": ["bar", "casual"],
+        "features": {"demo_role": "economical", "tradeoff": "menos orientado a bailar"},
+        "latitude": Decimal("-33.4391"),
+        "longitude": Decimal("-70.6505"),
+    },
+    {
+        "name": "Sala Reggaeton Prime",
+        "zone": "Oriente",
+        "entry_price": Decimal("9000"),
+        "average_drink_price": Decimal("3500"),
+        "music_tags": ["reggaeton", "latin"],
+        "ambience_tags": ["baile", "intenso"],
+        "features": {
+            "demo_role": "high_match_over_budget",
+            "tradeoff": "alta compatibilidad, mayor costo",
+        },
+        "latitude": Decimal("-33.4146"),
+        "longitude": Decimal("-70.5901"),
+    },
+    {
         "name": "Patio Lunar",
         "zone": "Centro",
         "entry_price": Decimal("0"),
@@ -97,12 +133,19 @@ VENUES = [
 def main() -> None:
     db = SessionLocal()
     try:
-        if not db.query(Venue).first():
-            for index, data in enumerate(VENUES):
+        for index, data in enumerate(VENUES):
+            existing_venue = db.query(Venue).filter(Venue.name == data["name"]).first()
+            if existing_venue is None:
                 db.add(
                     Venue(
-                        latitude=-33.45 + index / 100,
-                        longitude=-70.66 - index / 100,
+                        latitude=data.get(
+                            "latitude",
+                            Decimal("-33.45") + Decimal(index) / Decimal("100"),
+                        ),
+                        longitude=data.get(
+                            "longitude",
+                            Decimal("-70.66") - Decimal(index) / Decimal("100"),
+                        ),
                         opening_time=data.get("opening_time", time(20, 0)),
                         closing_time=data.get("closing_time", time(4, 0)),
                         minimum_age=data.get("minimum_age", 18),

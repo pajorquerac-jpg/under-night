@@ -1,7 +1,7 @@
-from dataclasses import dataclass
-from datetime import date, timedelta
 import re
 import unicodedata
+from dataclasses import dataclass
+from datetime import date, timedelta
 
 
 @dataclass(frozen=True)
@@ -67,6 +67,12 @@ def normalize_event_date(
     value = _normalize_text(raw_value)
 
     if value in {"hoy", "esta noche"}:
+        return DateNormalizationResult(
+            normalized_date=reference_date,
+            needs_confirmation=False,
+        )
+
+    if re.fullmatch(r"hoy\s+(?:lunes|martes|miercoles|jueves|viernes|sabado|domingo)", value):
         return DateNormalizationResult(
             normalized_date=reference_date,
             needs_confirmation=False,

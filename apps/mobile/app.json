@@ -15,8 +15,13 @@
       "barStyle": "light-content",
       "translucent": false
     },
-    "assetBundlePatterns": ["**/*"],
-    "plugins": ["expo-router"],
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "plugins": [
+      "expo-router",
+      "expo-font"
+    ],
     "ios": {
       "infoPlist": {
         "UIViewControllerBasedStatusBarAppearance": true
