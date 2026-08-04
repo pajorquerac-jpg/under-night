@@ -18,7 +18,6 @@ El monorepo separa la aplicacion movil (`apps/mobile`), la API (`apps/api`) y la
 
 - [Informe tecnico y funcional](docs/mvp-report.md)
 - [Diagramas de arquitectura](docs/diagrams.md)
-- [Guion de presentacion](docs/presentation-outline.md)
 
 ## Requisitos
 
